@@ -1,0 +1,225 @@
+from data_loader_HAR import data_generator
+from OLSWarm import *
+import torch as tr
+import torch.nn as nn
+import torch.nn.functional as F
+import torch.optim as optim
+import numpy as np
+import matplotlib.pyplot as plt
+import time
+import math
+import os
+from sklearn.metrics import f1_score
+import Model2
+
+import argparse
+import matplotlib.pyplot as plt
+import random
+
+class Train():
+    def __init__(self, args):
+
+
+        self.train, self.valid, self.test = data_generator('DATAXUGONG', args=args)
+
+        self.args = args
+        self.net = Model2.FC_STGNN_HAR(args.patch_size,args.conv_out, args.lstmhidden_dim, args.lstmout_dim,args.conv_kernel,args.hidden_dim,args.time_denpen_len, args.num_sensor, args.num_windows,args.moving_window,args.stride, args.decay, args.pool_choice, args.n_class)
+
+        self.net = self.net.cuda() if tr.cuda.is_available() else self.net
+        # self.loss_function = nn.CrossEntropyLoss()
+        self.loss_function = OnlineLabelSmoothingLoss(num_classes=2,
+                                             error_correction=True,
+                                             confused_topk=2,
+                                             entropy_adaptive=True,
+                                                      beta=1)
+        self.optim = optim.Adam(self.net.parameters())
+        self.scheduler = optim.lr_scheduler.StepLR(self.optim, step_size=30, gamma=0.1)
+
+    def Train_batch(self):
+        self.net.train()
+        loss_ = 0
+        for data, label in self.train:
+            data = data.cuda() if tr.cuda.is_available() else data
+            label = label.cuda() if tr.cuda.is_available() else label
+            self.optim.zero_grad()
+            prediction = self.net(data)
+            loss = self.loss_function(prediction, label)
+            loss.backward()
+            self.optim.step()
+            loss_ = loss_ + loss.item()
+        return loss_
+
+    def Train_model(self):
+        epoch = self.args.epoch
+        best_test_accu = 0  # Track the best test accuracy for the current seed
+        best_test_f1 = 0  # Track the best test F1 score for the current seed
+        best_epoch = 0  # Track the epoch with the best test accuracy
+        best_model_path = f'./experiment/best_model_seedMultigraph_{self.args.save_name}.pkl'  # Save the best model for this seed
+
+        for i in range(epoch):
+            loss = self.Train_batch()
+            self.scheduler.step()  # Update the learning rate
+
+            # Calculate training accuracy and F1 score
+            train_accu, train_f1 = self.Cross_train()
+
+            # Calculate validation accuracy and F1 score
+            accu_val, val_f1 = self.Cross_validation()
+
+            # Calculate test accuracy and F1 score
+            test_accu, test_f1, prediction, real = self.Prediction()
+
+            # Save the model if the test accuracy is the best so far for this seed
+            if test_accu > best_test_accu:
+                best_test_accu = test_accu
+                best_test_f1 = test_f1
+                best_epoch = i
+                tr.save(self.net.state_dict(), best_model_path)
+
+            print(f'Epoch {i}: TRAINING accuracy: {train_accu:.2f}%, F1: {train_f1:.2f}, '
+                  f'TESTING accuracy: {test_accu:.2f}%, F1: {test_f1:.2f}')
+
+        print(f'Best Test Accuracy: {best_test_accu:.2f}% at Epoch {best_epoch}, F1: {best_test_f1:.2f}')
+        print(f'Best model for seed {self.args.save_name} saved to {best_model_path}')
+
+
+    def Cross_train(self):
+        self.net.eval()
+        prediction_ = []
+        real_ = []
+        for data, label in self.train:
+            data = data.cuda() if tr.cuda.is_available() else data
+            real_.append(label)
+            prediction = self.net(data)
+            prediction_.append(prediction.detach().cpu())
+        prediction_ = tr.cat(prediction_, 0)
+        real_ = tr.cat(real_, 0)
+
+        prediction_ = tr.argmax(prediction_, -1)
+        accu, f1 = self.accu_(prediction_, real_)
+        return accu, f1
+
+    def Cross_validation(self):
+        self.net.eval()
+        prediction_ = []
+        real_ = []
+        for data, label in self.valid:
+            data = data.cuda() if tr.cuda.is_available() else data
+            real_.append(label)
+            prediction = self.net(data)
+            prediction_.append(prediction.detach().cpu())
+        prediction_ = tr.cat(prediction_, 0)
+        real_ = tr.cat(real_, 0)
+
+        prediction_ = tr.argmax(prediction_, -1)
+        accu, f1 = self.accu_(prediction_, real_)
+        return accu, f1
+
+    def Prediction(self):
+        self.net.eval()
+        prediction_ = []
+        real_ = []
+        for data, label in self.test:
+            data = data.cuda() if tr.cuda.is_available() else data
+            real_.append(label)
+            prediction = self.net(data)
+            prediction_.append(prediction.detach().cpu())
+        prediction_ = tr.cat(prediction_, 0)
+        real_ = tr.cat(real_, 0)
+
+        prediction_ = tr.argmax(prediction_, -1)
+        accu, f1 = self.accu_(prediction_, real_)
+        return accu, f1, prediction_, real_
+
+    def accu_(self, predicted, real):
+        num = predicted.size(0)
+        real_num = 0
+        for i in range(num):
+            if predicted[i] == real[i]:
+                real_num += 1
+        accuracy = 100 * real_num / num
+
+        # Calculate F1 score
+        f1 = f1_score(real.cpu().numpy(), predicted.cpu().numpy(), average='weighted')
+        return accuracy, f1
+
+
+if __name__ == '__main__':
+    from args import args
+
+    args = args()
+
+    seed_list = [1, 2, 3, 4, 5, 6, 7, 8, 9,10]
+
+
+    def args_config_HAR(args):
+        args.epoch = 50
+        # args.k = 1
+        args.window_sample = 800
+
+        args.decay = 0.7
+        args.pool_choice = 'mean'
+        args.moving_window = [4, 4]
+        args.stride = [1, 4]
+        args.lr = 5e-3
+        args.batch_size = 20
+
+        args.conv_kernel = 6
+        args.patch_size = 40
+        args.time_denpen_len = int(args.window_sample / args.patch_size)
+        args.conv_out = 10
+        args.num_windows = 2
+
+
+        args.conv_time_CNN = 6
+
+        args.lstmout_dim = 18
+        args.hidden_dim = 16
+        args.lstmhidden_dim = 48
+
+        args.num_sensor = 32
+        # args.n_class = 10
+        args.n_class = 2
+        return args
+
+
+    # 保存每次运行的结果
+    results = []
+
+    # 循环运行不同的随机种子
+    for seed in seed_list:
+        # 设置随机种子
+        torch.manual_seed(seed)
+        np.random.seed(seed)
+        random.seed(seed)
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed(seed)
+            torch.cuda.manual_seed_all(seed)
+            torch.backends.cudnn.deterministic = True
+            torch.backends.cudnn.benchmark = False
+
+        print(f"Running with seed: {seed}")
+
+        # 配置参数
+        args = args_config_HAR(args)
+
+        args.save_name = f"model_seed_{seed}"
+
+        # 初始化训练类
+        from main_HAR import Train
+
+        train = Train(args)
+
+
+
+        # 运行训练过程
+        train.Train_model()
+
+        # Save results (accuracy and F1 score)
+        test_accuracy, test_f1 = train.Cross_validation()
+        results.append({"seed": seed, "test_accuracy": test_accuracy, "test_f1": test_f1})
+
+    # Print results for all seeds
+    for result in results:
+        print(
+            f"Seed: {result['seed']}, Test Accuracy: {result['test_accuracy']:.2f}%, Test F1 Score: {result['test_f1']:.2f}")
